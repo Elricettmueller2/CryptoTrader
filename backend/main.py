@@ -1,12 +1,11 @@
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import ccxt.async_support as ccxt_async 
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+import ccxt
+import ccxt.async_support as ccxt_async
 import logging
 from urllib.parse import unquote
 from datetime import datetime
-import logging
 import asyncio
-import ccxt
 
 app = FastAPI()
 
@@ -30,9 +29,15 @@ async def get_live_data(pair: str):
 async def websocket_endpoint(websocket: WebSocket, pair: str):
     await websocket.accept()
     decoded_pair = unquote(pair)
-    formatted_pair = decoded_pair
+    formatted_pair = decoded_pair  # Use the pair as is
+
     exchange = ccxt_async.binance()
+
     try:
+        markets = await exchange.load_markets()
+        if formatted_pair not in markets:
+            await websocket.send_json({'error': f"Market {formatted_pair} not found"})
+            return  # Exit to prevent further execution
         while True:
             ticker = await exchange.fetch_ticker(formatted_pair)
             await websocket.send_json({
@@ -44,14 +49,14 @@ async def websocket_endpoint(websocket: WebSocket, pair: str):
                 'low': ticker['low'],
                 'volume': ticker['baseVolume'],
             })
-            await asyncio.sleep(1)  # Adjust the interval as needed
+            await asyncio.sleep(1)
     except WebSocketDisconnect:
         logging.info("WebSocket disconnected")
     except Exception as e:
         logging.error(f"Error in WebSocket: {e}")
     finally:
         await exchange.close()
-        await websocket.close()
+
 
 @app.get("/markets")
 async def get_markets():
@@ -64,6 +69,16 @@ async def get_markets():
     except Exception as e:
         logging.error(f"Error loading markets: {e}")
         return {"error": str(e)}
+
+@app.post("/create-strategy/")
+async def create_strategy(strategy_name: str, parameters: dict):
+    if strategy_name not in STRATEGY_REGISTRY:
+        raise HTTPException(status_code=400, detail="Strategy not found.")
+    
+    strategy_class = STRATEGY_REGISTRY[strategy_name]
+    strategy_instance = strategy_class(**parameters)  # Dynamically pass parameters
+    
+    return {"message": f"{strategy_name} strategy created with parameters {parameters}"}
 
 
 @app.get("/historical-data/{pair:path}")

@@ -1,12 +1,13 @@
-===== main.py =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/main.py =====
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import ccxt.async_support as ccxt_async 
+import ccxt
+import ccxt.async_support as ccxt_async
 import logging
 from urllib.parse import unquote
 from datetime import datetime
-import logging
 import asyncio
+
 
 app = FastAPI()
 
@@ -30,12 +31,15 @@ async def get_live_data(pair: str):
 async def websocket_endpoint(websocket: WebSocket, pair: str):
     await websocket.accept()
     decoded_pair = unquote(pair)
-    formatted_pair = decoded_pair  # No need to replace '-' with '/'
-    exchange = ccxt_async.binance()
-    # Rest of the code...
+    formatted_pair = decoded_pair  # Use the pair as is
 
+    exchange = ccxt_async.binance()
 
     try:
+        markets = await exchange.load_markets()
+        if formatted_pair not in markets:
+            await websocket.send_json({'error': f"Market {formatted_pair} not found"})
+            return  # Exit to prevent further execution
         while True:
             ticker = await exchange.fetch_ticker(formatted_pair)
             await websocket.send_json({
@@ -47,14 +51,14 @@ async def websocket_endpoint(websocket: WebSocket, pair: str):
                 'low': ticker['low'],
                 'volume': ticker['baseVolume'],
             })
-            await asyncio.sleep(1)  # Adjust the interval as needed
+            await asyncio.sleep(1)
     except WebSocketDisconnect:
         logging.info("WebSocket disconnected")
     except Exception as e:
         logging.error(f"Error in WebSocket: {e}")
     finally:
         await exchange.close()
-        await websocket.close()
+
 
 @app.get("/markets")
 async def get_markets():
@@ -94,7 +98,289 @@ async def get_historical_data(pair: str, timeframe: str = "1h", start_date: str 
         return {"error": str(e)}
 
 
-===== App.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/strategies/__init__.py =====
+# strategies/__init__.py
+
+from .base_strategy import BaseStrategy
+from .moving_average_crossover import MovingAverageCrossoverStrategy
+from .rsi_strategy import RSIStrategy
+from .sma_strategy import SimpleMovingAverageStrategy  # Import the new strategy
+
+STRATEGY_REGISTRY = {
+    'moving_average_crossover': MovingAverageCrossoverStrategy,
+    'rsi': RSIStrategy,
+    'simple_moving_average': SimpleMovingAverageStrategy,  # Add the SMA strategy
+}
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/strategies/moving_average_crossover.py =====
+# strategies/moving_average_crossover.py
+
+import pandas as pd
+import numpy as np
+from .base_strategy import BaseStrategy
+
+class MovingAverageCrossoverStrategy(BaseStrategy):
+    def __init__(self, short_window=50, long_window=200):
+        self.short_window = short_window
+        self.long_window = long_window
+
+    def generate_signals(self, data):
+        signals = pd.DataFrame(index=data.index)
+        signals['signal'] = 0.0
+
+        # Calculate short and long moving averages
+        signals['short_mavg'] = data['close'].rolling(window=self.short_window, min_periods=1).mean()
+        signals['long_mavg'] = data['close'].rolling(window=self.long_window, min_periods=1).mean()
+
+        # Avoid chained assignment by using .iloc or .loc properly
+        condition = signals['short_mavg'].iloc[self.short_window:] > signals['long_mavg'].iloc[self.short_window:]
+        signals.loc[signals.index[self.short_window:], 'signal'] = np.where(condition, 1.0, 0.0)
+
+        # Generate trading orders (buy = 1, sell = -1)
+        signals['positions'] = signals['signal'].diff()
+
+        # Ensure no NaN values in the signals
+        signals = signals.fillna(0)
+
+        return signals
+
+    def execute_trades(self):
+        pass
+
+    def analyze_performance(self):
+        pass
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/strategies/sma_strategy.py =====
+# strategies/sma_strategy.py
+
+import pandas as pd
+import numpy as np
+from .base_strategy import BaseStrategy
+
+class SimpleMovingAverageStrategy(BaseStrategy):
+    def __init__(self, window=50):
+        self.window = window
+
+    def generate_signals(self, data):
+        signals = pd.DataFrame(index=data.index)
+        signals['signal'] = 0.0
+
+        # Ensure no NaN values in the data (ffill and bfill to fill missing values)
+        data['close'] = data['close'].ffill().bfill()
+
+        # Calculate the simple moving average (SMA)
+        sma = data['close'].rolling(window=self.window, min_periods=1).mean()
+
+        # Buy when price is above the SMA, sell when price is below
+        signals['signal'] = np.where(data['close'] > sma, 1.0, -1.0)
+
+        # Debug: Check for NaN values in the signals
+        if signals.isnull().any().any():
+            print("There are NaN values in the signals after processing.")
+
+        # Fill NaN values in signals with 0 to ensure valid output
+        signals = signals.fillna(0)
+
+        # Generate trading orders (buy = 1, sell = -1)
+        signals['positions'] = signals['signal'].diff()
+
+        return signals
+
+    def execute_trades(self):
+        """Not implemented: this function will execute live trades."""
+        pass
+
+    def analyze_performance(self):
+        """Performance analysis will be handled by the backtester."""
+        pass
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/strategies/rsi_strategy.py =====
+# strategies/rsi_strategy.py
+
+import pandas as pd
+import numpy as np
+from .base_strategy import BaseStrategy
+
+class RSIStrategy(BaseStrategy):
+    def __init__(self, window=14, buy_threshold=30, sell_threshold=70):
+        self.window = window
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+
+    def generate_signals(self, data):
+        signals = pd.DataFrame(index=data.index)
+        signals['signal'] = 0.0
+
+        # Ensure no NaN values in the data (use ffill and bfill as recommended)
+        data['close'] = data['close'].ffill().bfill()
+
+        # Calculate the Relative Strength Index (RSI)
+        delta = data['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=self.window).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=self.window).mean()
+
+        # Avoid division by zero or NaN in RSI calculation
+        rs = gain / loss
+        rs = rs.replace([np.inf, -np.inf], 0)  # Replace any infinite values with 0
+        rsi = 100 - (100 / (1 + rs))
+
+        # Check for NaN values in RSI and handle them
+        rsi = rsi.fillna(50)  # Set neutral RSI value for missing data
+
+        # Debug: Check for NaN in RSI values
+        if rsi.isnull().any():
+            print("There are NaN values in the RSI calculation.")
+
+        # Buy signal when RSI is below buy_threshold
+        signals['signal'] = np.where(rsi < self.buy_threshold, 1.0, 0.0)
+
+        # Sell signal when RSI is above sell_threshold
+        signals['signal'] = np.where(rsi > self.sell_threshold, -1.0, signals['signal'])
+
+        # Generate trading orders (buy = 1, sell = -1)
+        signals['positions'] = signals['signal'].diff()
+
+        # Debug: Check for NaN values in the signals
+        if signals.isnull().any().any():
+            print("There are NaN values in the signals after processing.")
+        
+        return signals
+
+    def execute_trades(self):
+        """Not implemented: this function will execute live trades."""
+        pass
+
+    def analyze_performance(self):
+        """Performance analysis will be handled by the backtester."""
+        pass
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/backtesting/__init__.py =====
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/backtesting/backtester.py =====
+# backtesting/backtester.py
+
+import pandas as pd
+
+class Backtester:
+    def __init__(self, strategy, data, initial_capital=10000.0):
+        self.strategy = strategy
+        self.data = data
+        self.initial_capital = initial_capital
+        self.positions = None
+        self.portfolio = None
+
+    def run_backtest(self):
+        signals = self.strategy.generate_signals(self.data)
+
+        # Ensure no NaN values in signals before proceeding
+        signals = signals.fillna(0)
+
+        self.positions = signals['signal']
+
+        # Debug: Check if any positions were created
+        print(f"Total positions generated: {self.positions.sum()}")
+
+        # Calculate portfolio performance
+        self.calculate_portfolio_performance(signals)
+
+        # Debug: Check initial portfolio value
+        if self.portfolio['total'].iloc[0] == 0:
+            print("Initial portfolio value is 0, which causes division by zero in performance calculations.")
+        if self.positions.sum() == 0:
+            print("No positions were generated during the backtest, hence no trades were made.")
+
+        return self.portfolio
+
+    def calculate_portfolio_performance(self, signals):
+        positions = pd.DataFrame(index=signals.index).fillna(0.0)
+        positions['positions'] = signals['positions']
+        
+        # Calculate cumulative positions held (number of units)
+        positions['cum_positions'] = positions['positions'].cumsum()
+        
+        # Ensure cumulative positions are not negative (no short selling)
+        positions['cum_positions'] = positions['cum_positions'].clip(lower=0)
+        
+        # Calculate holdings and cash
+        portfolio = pd.DataFrame(index=positions.index)
+        portfolio['holdings'] = positions['cum_positions'] * self.data['close']
+        trade_value = positions['positions'] * self.data['close']
+        portfolio['cash'] = self.initial_capital - trade_value.cumsum()
+        
+        # Ensure cash doesn't go negative
+        portfolio['cash'] = portfolio['cash'].clip(lower=0)
+        
+        portfolio['total'] = portfolio['cash'] + portfolio['holdings']
+        portfolio['returns'] = portfolio['total'].pct_change().fillna(0)
+        
+        self.portfolio = portfolio
+
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/backtesting/performance.py =====
+# backtesting/performance.py
+
+import numpy as np
+
+def calculate_performance_metrics(portfolio, risk_free_rate=0.0):
+    returns = portfolio['returns']
+    total_return = portfolio['total'][-1] / portfolio['total'][0] - 1
+    annualized_return = np.mean(returns) * 252
+    annualized_volatility = np.std(returns) * np.sqrt(252)
+    sharpe_ratio = (annualized_return - risk_free_rate) / annualized_volatility
+    max_drawdown = calculate_max_drawdown(portfolio['total'])
+    metrics = {
+        'Total Return': total_return,
+        'Annualized Return': annualized_return,
+        'Annualized Volatility': annualized_volatility,
+        'Sharpe Ratio': sharpe_ratio,
+        'Max Drawdown': max_drawdown,
+    }
+    return metrics
+
+def calculate_max_drawdown(total_portfolio_value):
+    cumulative_max = total_portfolio_value.cummax()
+    drawdown = (total_portfolio_value - cumulative_max) / cumulative_max
+    max_drawdown = drawdown.min()
+    return max_drawdown
+
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/data/__init__.py =====
+from .data_loader import fetch_historical_data
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/data/data_loader.py =====
+# data/data_loader.py
+
+import ccxt
+import pandas as pd
+
+def fetch_historical_data(pair, timeframe='1d', since=None, limit=1000):
+    exchange = ccxt.binance()
+    ohlcv = exchange.fetch_ohlcv(symbol=pair, timeframe=timeframe, since=since, limit=limit)
+    data = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    data['timestamp'] = pd.to_datetime(data['timestamp'], unit='ms')
+    data.set_index('timestamp', inplace=True)
+
+    # Fill missing data (forward and backward fill to avoid NaNs)
+    data = data.ffill().bfill()
+
+    # Check for any remaining NaN values
+    if data.isnull().any().any():
+        print("There are still NaN values in the data after filling.")
+
+    return data
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/backend/utils/__init__.py =====
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/App.js =====
 import React from 'react';
 import Markets from './components/Markets';
 import Dashboard from './components/Dashboard';  // Assuming Dashboard has the chart component
@@ -114,7 +400,7 @@ function App() {
 export default App;
 
 
-===== index.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/index.js =====
 import React from 'react';
 import { createRoot } from 'react-dom/client';  // Import createRoot from React 18
 import App from './App';
@@ -129,7 +415,7 @@ root.render(
 );
 
 
-===== apiService.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/apiService.js =====
 // src/apiService.js
 import axios from 'axios';
 
@@ -191,7 +477,7 @@ export const fetchHistoricalData = async (pair, timeframe, startDate, endDate) =
 
 
 
-===== Chart.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/Chart.js =====
 // src/components/Chart.js
 import React from 'react';
 import Plot from 'react-plotly.js';
@@ -216,7 +502,7 @@ const Chart = ({ data, layout }) => {
 export default Chart;
 
 
-===== Markets.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/Markets.js =====
 import React, { useEffect, useState } from 'react';
 import { fetchMarkets } from '../apiService';
 
@@ -322,13 +608,139 @@ function Markets() {
 export default Markets;
 
 
-===== Header.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/PriceTicker.js =====
+import React, { useState, useEffect } from 'react';
+import { fetchLiveData } from '../apiService';
+
+const PriceTicker = ({ market }) => {
+    const [price, setPrice] = useState(null);
+
+    useEffect(() => {
+        const fetchData = async () => {
+            const data = await fetchLiveData(market);
+            if (data && data.pair_received) {
+                setPrice(data.price); // Assume price is part of the API response
+            }
+        };
+
+        fetchData();
+        const interval = setInterval(fetchData, 5000); // Update every 5 seconds
+
+        return () => clearInterval(interval);
+    }, [market]);
+
+    return (
+        <div>
+            <h2>Live Price for {market}: {price ? `$${price}` : 'Loading...'}</h2>
+        </div>
+    );
+};
+
+export default PriceTicker;
 
 
-===== LiveData.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/fetchMarkets.js =====
 
 
-===== MarketList.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/Dashboard.js =====
+// src/components/Dashboard.js
+import React, { useState, useEffect, useRef } from 'react';
+import Chart from './Chart';
+import MarketSelector from './MarketSelector';
+
+
+const Dashboard = () => {
+    const [liveData, setLiveData] = useState([]);
+    const [selectedPair, setSelectedPair] = useState('BTC/USDT');
+    const ws = useRef(null);
+
+    // Connect to WebSocket when selectedPair changes
+    useEffect(() => {
+        if (ws.current) {
+            ws.current.close();
+        }
+
+        ws.current = new WebSocket(`ws://localhost:8000/ws/${encodeURIComponent(selectedPair)}`);
+
+        ws.current.onopen = () => {
+            console.log('WebSocket connection opened');
+        };
+
+        ws.current.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            console.log('Received data:', data);
+
+            setLiveData((prevData) => {
+                const newData = [...prevData, data];
+                // Limit data to the last 1000 points
+                if (newData.length > 1000) {
+                    newData.shift();
+                }
+                return newData;
+            });
+        };
+
+        ws.current.onerror = (error) => {
+            console.error('WebSocket error:', error);
+        };
+
+        ws.current.onclose = () => {
+            console.log('WebSocket connection closed');
+        };
+
+        // Cleanup on unmount or pair change
+        return () => {
+            if (ws.current) {
+                ws.current.close();
+            }
+        };
+    }, [selectedPair]);
+
+    // Prepare data for the chart
+    const chartData = [
+        {
+            x: liveData.map((d) => new Date(d.timestamp)),
+            y: liveData.map((d) => d.last),
+            type: 'scatter',
+            mode: 'lines',
+            line: { color: 'blue' },
+        },
+    ];
+
+    const layout = {
+        title: `${selectedPair} Live Price`,
+        xaxis: { title: 'Time' },
+        yaxis: { title: 'Price' },
+    };
+
+    const handleMarketSelect = (market) => {
+        setSelectedPair(market);
+        setLiveData([]);
+    };
+    
+
+    
+
+    return (
+        <div>
+            <h2>{selectedPair} Live Chart</h2>
+            <MarketSelector onMarketSelect={handleMarketSelect} />
+            <Chart data={chartData} layout={layout} />
+        </div>
+    );
+};
+
+
+export default Dashboard;
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/Header.js =====
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/LiveData.js =====
+
+
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/MarketList.js =====
 // src/components/MarketList.js
 import React, { useEffect, useState } from 'react';
 import { fetchMarkets } from '../apiService';
@@ -359,8 +771,8 @@ const MarketList = () => {
 export default MarketList;
 
 
-===== MarketSelector.js =====
-// src/components/MarketSelector.js
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/MarketSelector.js =====
+  // src/components/MarketSelector.js
 import React, { useState, useEffect } from 'react';
 import { fetchMarkets } from '../apiService';
 
@@ -401,6 +813,6 @@ const MarketSelector = ({ onMarketSelect }) => {
 export default MarketSelector;
 
 
-===== SettingsPanel.js =====
+===== /Users/elricettmuller/Programming/trading_platform/CryptoTrader/frontend/src/components/SettingsPanel.js =====
 
 
